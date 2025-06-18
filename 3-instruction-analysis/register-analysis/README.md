@@ -68,13 +68,13 @@ add r0, r0, #68          // 偏移到after区域
 #### 编译
 ```bash
 # 基本编译
-gcc -o reg_compare reg_compare.c
+arm-linux-gnueabihf-gcc -marm -march=armv8-a -mfpu=vfpv4 -fomit-frame-pointer -mfloat-abi=hard -o reg_compare reg_compare.c
 
 # 静态链接（推荐）
-gcc -o reg_compare reg_compare.c -static
+arm-linux-gnueabihf-gcc -marm -march=armv8-a -mfpu=vfpv4 -fomit-frame-pointer -mfloat-abi=hard -o reg_compare reg_compare.c -static
 
 # 调试版本
-gcc -g -O0 -o reg_compare reg_compare.c
+arm-linux-gnueabihf-gcc -marm -march=armv8-a -mfpu=vfpv4 -fomit-frame-pointer -mfloat-abi=hard -g -O0 -o reg_compare reg_compare.c
 ```
 
 #### 基本使用

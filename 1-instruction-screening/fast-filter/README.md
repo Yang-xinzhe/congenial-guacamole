@@ -39,13 +39,13 @@
 ### 编译选项
 ```bash
 # 基本编译
-gcc -o ins_check ins_check.c
+arm-linux-gnueabihf-gcc -marm -march=armv8-a -mfpu=vfpv4 -fomit-frame-pointer -mfloat-abi=hard -o ins_check ins_check.c
 
 # 静态链接（推荐）
-gcc -o ins_check ins_check.c -static
+arm-linux-gnueabihf-gcc -marm -march=armv8-a -mfpu=vfpv4 -fomit-frame-pointer -mfloat-abi=hard -o ins_check ins_check.c -static
 
 # 调试版本
-gcc -g -O0 -o ins_check ins_check.c -DDEBUG
+arm-linux-gnueabihf-gcc -marm -march=armv8-a -mfpu=vfpv4 -fomit-frame-pointer -mfloat-abi=hard -g -O0 -o ins_check ins_check.c -DDEBUG
 ```
 
 ### 使用方法

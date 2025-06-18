@@ -41,7 +41,7 @@ congenial-guacamole/
 1. **编译筛选工具**：
    ```bash
    cd 1-instruction-screening/fast-filter
-   gcc -o ins_check ins_check.c
+   arm-linux-gnueabihf-gcc -marm -march=armv8-a -mfpu=vfpv4 -fomit-frame-pointer -mfloat-abi=hard -o ins_check ins_check.c
    ```
 
 2. **运行指令筛选**：
@@ -59,7 +59,7 @@ congenial-guacamole/
 4. **分析指令**：
    ```bash
    cd 3-instruction-analysis/register-analysis
-   gcc -o reg_compare reg_compare.c
+   arm-linux-gnueabihf-gcc -marm -march=armv8-a -mfpu=vfpv4 -fomit-frame-pointer -mfloat-abi=hard -o reg_compare reg_compare.c
    ```
 
 ## 技术特点

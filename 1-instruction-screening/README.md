@@ -43,19 +43,19 @@
 ### 编译快速过滤器
 ```bash
 cd fast-filter
-gcc -o ins_check ins_check.c -static
+arm-linux-gnueabihf-gcc -marm -march=armv8-a -mfpu=vfpv4 -fomit-frame-pointer -mfloat-abi=hard -o ins_check ins_check.c -static
 ```
 
 ### 编译测试框架
 ```bash
-gcc -o inst_testframe inst_testframe.c
+arm-linux-gnueabihf-gcc -marm -march=armv8-a -mfpu=vfpv4 -fomit-frame-pointer -mfloat-abi=hard -o inst_testframe inst_testframe.c
 ```
 
 ### 编译超时过滤器
 ```bash
 cd timeout-filter
-gcc -o dispatcher dispatcher.c
-gcc -o single_check single_check.c
+arm-linux-gnueabihf-gcc -marm -march=armv8-a -mfpu=vfpv4 -fomit-frame-pointer -mfloat-abi=hard -o dispatcher dispatcher.c
+arm-linux-gnueabihf-gcc -marm -march=armv8-a -mfpu=vfpv4 -fomit-frame-pointer -mfloat-abi=hard -o single_check single_check.c
 ```
 
 ## 使用方法

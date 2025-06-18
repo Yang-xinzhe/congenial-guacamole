@@ -53,19 +53,19 @@ typedef struct {
 ### 编译寄存器分析工具
 ```bash
 cd register-analysis
-gcc -o reg_compare reg_compare.c -static
+arm-linux-gnueabihf-gcc -marm -march=armv8-a -mfpu=vfpv4 -fomit-frame-pointer -mfloat-abi=hard -o reg_compare reg_compare.c -static
 ```
 
 ### 编译PMU分析工具
 ```bash
 cd pmu-analysis
-gcc -o pmu_test pmu_test.c
+arm-linux-gnueabihf-gcc -marm -march=armv8-a -mfpu=vfpv4 -fomit-frame-pointer -mfloat-abi=hard -o pmu_test pmu_test.c
 ```
 
 ### 编译宏分析器
 ```bash
 cd register-analysis
-gcc -o macro_analyzer macro_analyzer.c
+arm-linux-gnueabihf-gcc -marm -march=armv8-a -mfpu=vfpv4 -fomit-frame-pointer -mfloat-abi=hard -o macro_analyzer macro_analyzer.c
 ```
 
 ## 使用方法
