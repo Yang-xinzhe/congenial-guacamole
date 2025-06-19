@@ -70,35 +70,6 @@ void test_instruction(void)
         :::);
 }
 
-// int init_memory_monitor(PmuCounter *pmu) {
-//     struct perf_event_attr attr = {0};
-//     attr.type = 8; // armv8_cortex_a53
-//     attr.size = sizeof(attr);
-//     attr.disabled = 1;
-//     attr.exclude_kernel = 1;
-//     attr.exclude_hv = 1;
-//     attr.exclude_guest = 1;
-//     attr.exclude_idle = 1;
-//     attr.pinned = 1;
-//     attr.exclusive = 1; // Disable kernel switch
-    
-//     // 绑定到CPU 0适配big.LITTLE架构
-//     attr.config = 0x0006; // LD_RETIRED
-//     pmu->ld_retired_fd = perf_event_open(&attr, 0, 1, -1, 0);
-    
-//     attr.config = 0x0007; // ST_RETIRED
-//     pmu->st_retired_fd = perf_event_open(&attr, 0, 1, -1, 0);
-
-//     printf("LD_RETIRED: %s (fd=%d)\n", pmu->ld_retired_fd != -1 ? "OK" : "FAIL", pmu->ld_retired_fd);
-//     printf("ST_RETIRED: %s (fd=%d)\n", pmu->st_retired_fd != -1 ? "OK" : "FAIL", pmu->st_retired_fd);
-    
-//     if (pmu->ld_retired_fd == -1 && pmu->st_retired_fd == -1) {
-//         printf("警告: PMU事件无法打开，可能需要root权限\n");
-//         printf("尝试: echo 0 | sudo tee /proc/sys/kernel/perf_event_paranoid\n");
-//     }
-    
-//     return 0;
-// }
 
 int init_memory_monitor(PmuCounter *pmu) {
     struct perf_event_attr attr = {0};
@@ -287,21 +258,58 @@ size_t fill_insn_buffer(uint8_t *buf, size_t buf_size, uint32_t insn)
 }
 
 void print_test_result(uint32_t instruction, TestResult *result) {
-    printf("\n=== 指令内存访问分析结果 ===\n");
-    printf("测试指令: 0x%08X\n", instruction);
-    printf("精确计数结果:\n");
-    printf("  加载指令: %llu\n", result->ld_count);
-    printf("  存储指令: %llu\n", result->st_count);
+    // printf("\n=== 指令内存访问分析结果 ===\n");
+    // printf("测试指令: 0x%08X\n", instruction);
+    // printf("精确计数结果:\n");
+    // printf("  加载指令: %llu\n", result->ld_count);
+    // printf("  存储指令: %llu\n", result->st_count);
     
-    if (result->ld_count == 0 && result->st_count == 0) {
-        printf("  -> 该指令不涉及内存访问\n");
-    } else if (result->ld_count > 0 && result->st_count == 0) {
-        printf("  -> 该指令只涉及内存加载\n");
-    } else if (result->ld_count == 0 && result->st_count > 0) {
-        printf("  -> 该指令只涉及内存存储\n");
+    // if (result->ld_count == 0 && result->st_count == 0) {
+    //     printf("  -> 该指令不涉及内存访问\n");
+    // } else if (result->ld_count > 0 && result->st_count == 0) {
+    //     printf("  -> 该指令只涉及内存加载\n");
+    // } else if (result->ld_count == 0 && result->st_count > 0) {
+    //     printf("  -> 该指令只涉及内存存储\n");
+    // } else {
+    //     printf("  -> 该指令涉及内存加载和存储\n");
+    // }
+    printf("测试指令: 0x%08X", instruction);
+    
+    // 基准值：nop指令的背景噪声
+    uint64_t base_ld = 17;
+    uint64_t base_st = 5;
+    
+    // 计算相对于基准的增量
+    int64_t ld_delta = result->ld_count - base_ld;
+    int64_t st_delta = result->st_count - base_st;
+    
+    printf(" | LD:%llu(%+lld) ST:%llu(%+lld)", 
+           result->ld_count, ld_delta, result->st_count, st_delta);
+    
+    // 判断指令类型
+    if (ld_delta == 0 && st_delta == 0) {
+        printf(" -> 不涉及内存访问");
+    } else if (ld_delta == 1 && st_delta == 0) {
+        printf(" -> LDR指令(单次加载)");
+    } else if (ld_delta == 0 && st_delta == 1) {
+        printf(" -> STR指令(单次存储)");
+    } else if (ld_delta == 1 && st_delta == 1) {
+        printf(" -> 同时加载+存储指令");
+    } else if (ld_delta == 2 && st_delta == 0) {
+        printf(" -> 双次加载指令");
+    } else if (ld_delta == 0 && st_delta == 2) {
+        printf(" -> 双次存储指令");
+    } else if (ld_delta > 0 && st_delta == 0) {
+        printf(" -> 多次加载指令(%lld次)", ld_delta);
+    } else if (ld_delta == 0 && st_delta > 0) {
+        printf(" -> 多次存储指令(%lld次)", st_delta);
+    } else if (ld_delta > 0 && st_delta > 0) {
+        printf(" -> 复合访存指令(LD:%lld, ST:%lld)", ld_delta, st_delta);
     } else {
-        printf("  -> 该指令涉及内存加载和存储\n");
+        printf(" -> 异常情况(LD:%lld, ST:%lld)", ld_delta, st_delta);
     }
+    
+    printf("\n");
 }
 
 int main(int argc, const char* argv[]) {
@@ -327,9 +335,42 @@ int main(int argc, const char* argv[]) {
         0xE58D0000,  // str r0, [sp]        - 1次store
         0xE58D0004,  // str r0, [sp, #4]    - 1次store
         
-        0xE1D000B0,  // ldrh r0, [r0]       - 半字load
-        0xE5C00000,  // strb r0, [r0]       - 字节store
-        0xE5D00000,  // ldrb r0, [r0]       - 字节load
+        // === 更多安全的Load指令（使用sp基址）===
+        0xE59D0008,  // ldr r0, [sp, #8]    - load sp+8
+        0xE59D000C,  // ldr r0, [sp, #12]   - load sp+12
+        0xE59D0010,  // ldr r0, [sp, #16]   - load sp+16
+        0xE59D1000,  // ldr r1, [sp]        - load到r1
+        0xE59D1004,  // ldr r1, [sp, #4]    - load到r1+偏移
+        0xE59D2000,  // ldr r2, [sp]        - load到r2
+        0xE51D0004,  // ldr r0, [sp, #-4]   - load sp-4（负偏移）
+        0xE51D0008,  // ldr r0, [sp, #-8]   - load sp-8
+        
+        // === 更多安全的Store指令（使用sp基址）===
+        0xE58D0008,  // str r0, [sp, #8]    - store sp+8
+        0xE58D000C,  // str r0, [sp, #12]   - store sp+12
+        0xE58D0010,  // str r0, [sp, #16]   - store sp+16
+        0xE58D1000,  // str r1, [sp]        - store r1到栈
+        0xE58D1004,  // str r1, [sp, #4]    - store r1+偏移
+        0xE58D2000,  // str r2, [sp]        - store r2到栈
+        0xE50D0004,  // str r0, [sp, #-4]   - store sp-4（负偏移）
+        0xE50D0008,  // str r0, [sp, #-8]   - store sp-8
+        
+        // === 字节访存（使用sp基址，更安全）===
+        0xE5DD0000,  // ldrb r0, [sp]       - 字节load
+        0xE5DD0001,  // ldrb r0, [sp, #1]   - 字节load+1
+        0xE5DD0002,  // ldrb r0, [sp, #2]   - 字节load+2
+        0xE5CD0000,  // strb r0, [sp]       - 字节store
+        0xE5CD0001,  // strb r0, [sp, #1]   - 字节store+1
+        0xE5CD0002,  // strb r0, [sp, #2]   - 字节store+2
+
+        // 添加一些调试指令来验证异常
+        0xE58D0000,  // str r0, [sp]     - 对比：应该ST+1
+        0xE58D1000,  // str r1, [sp]     - 异常：显示ST+2  
+        0xE58D2000,  // str r2, [sp]     - 测试：是否也ST+2？
+
+        // 测试寄存器初始化的影响
+        0xE3A01000,  // mov r1, #0       - 先初始化r1
+        0xE58D1000,  // str r1, [sp]     - 再测试存储
     };
 
     int total_tests = sizeof(test_instructions) / sizeof(test_instructions[0]);
@@ -337,8 +378,8 @@ int main(int argc, const char* argv[]) {
         uint32_t hidden_instruction = test_instructions[i];
         uint8_t insn_bytes[4];
 
-        printf("=== ARM隐藏指令PMU精确分析 ===\n");
-        printf("测试指令: 0x%08X\n", hidden_instruction);
+        // printf("=== ARM隐藏指令PMU精确分析 ===\n");
+        // printf("测试指令: 0x%08X\n", hidden_instruction);
 
         if(init_insn_page() != 0) {
             printf("init_insn_page failed\n");
