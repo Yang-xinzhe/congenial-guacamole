@@ -79,8 +79,8 @@ uint32_t insn_test_plate_length;
 void test_instruction(void) __attribute__((optimize("O0")));
 
 typedef struct {
-    int ld_retired_fd;      // 加载指令相关事件
-    int st_retired_fd;      // 存储指令相关事件
+    int ld_retired_fd;      // Load retired
+    int st_retired_fd;      // Store retired
 } PmuCounter;
 
 typedef struct {
@@ -161,33 +161,33 @@ void test_instruction(void)
         "push {r0-r12, lr} \n"
         "ldr r0, =0x60000000   \n"
 
-        // 保存r0
+        // Save r0
         "ldr r1, [sp, #0]      \n"    
         "str r1, [r0, #0]      \n"    
         
-        // 保存r1
+        // Save r1
         "ldr r1, [sp, #4]      \n"    
         "str r1, [r0, #4]      \n"    
         
-        // 修复：正确保存r2-r12，分两部分处理
-        "add r1, sp, #8        \n"    // 指向栈上r2
-        "add r2, r0, #8        \n"    // 指向目标r2位置
-        "ldmia r1!, {r3-r12}   \n"    // 加载r2-r11到r3-r12（10个值）
-        "stmia r2!, {r3-r12}   \n"    // 存储到r2-r11位置（10个值）
+        // Fix: Save r2-r12, split into two parts
+        "add r1, sp, #8        \n"    // Point to r2 on stack
+        "add r2, r0, #8        \n"    // Point to r2 in target
+        "ldmia r1!, {r3-r12}   \n"    // Load r2-r11 to r3-r12 (10 values)
+        "stmia r2!, {r3-r12}   \n"    // Store to r2-r11 (10 values)
         
-        // 单独处理r12
-        "ldr r1, [sp, #48]     \n"    // 加载栈上r12
-        "str r1, [r0, #48]     \n"    // 存储到目标r12位置
+        // Handle r12 separately
+        "ldr r1, [sp, #48]     \n"    // Load r12 from stack
+        "str r1, [r0, #48]     \n"    // Store to r12 in target
         
-        // 保存lr
+        // Save lr
         "ldr r1, [sp, #52]     \n"    
         "str r1, [r0, #56]     \n"    
         
-        // 修复：移除CPSR清零，直接读取当前状态
+        
         "mrs r1, cpsr          \n"
         "str r1, [r0, #64]     \n"    
         
-        // 保存SP和PC
+        // Save SP and PC
         "mov r1, sp            \n"
         "add r1, r1, #56       \n"    
         "str r1, [r0, #52]     \n"    
@@ -203,30 +203,30 @@ void test_instruction(void)
 
         "dsb \n"
 
-        // 第二部分：执行后保存（同样修复）
+        // Second part:
         "push {r0-r12, lr} \n"
         "ldr r0, =0x60000000   \n"
         "add r0, r0, #68       \n"
 
-        // 保存r0
+        // Save r0
         "ldr r1, [sp, #0]      \n"
         "str r1, [r0, #0]      \n"
         
-        // 保存r1
+        // Save r1
         "ldr r1, [sp, #4]      \n"
         "str r1, [r0, #4]      \n"
         
-        // 修复：正确保存r2-r11
+        // Fix: Save r2-r11
         "add r1, sp, #8        \n"
         "add r2, r0, #8        \n"
         "ldmia r1!, {r3-r12}   \n"
         "stmia r2!, {r3-r12}   \n"
         
-        // 单独处理r12
+        // Handle r12 separately
         "ldr r1, [sp, #48]     \n"
         "str r1, [r0, #48]     \n"
         
-        // 保存其余寄存器
+        // Save other registers
         "ldr r1, [sp, #52]     \n"
         "str r1, [r0, #56]     \n"
         
@@ -241,7 +241,7 @@ void test_instruction(void)
         "pop {r0-r12, lr} \n"
 
         "bx lr \n"
-
+        // .ltorg is used to align the code to 4 bytes for load immediates to registers
         ".ltorg\n"
 
         ".global insn_test_plate_end \n"
@@ -413,7 +413,7 @@ void print_report(RegChangeInfo *regs_info, CpsrChangeInfo *cpsr_info, RegisterS
             uint32_t after_mode = cpsr_info->after_value & 0x1F;
             printf("   mode: 0x%02X -> 0x%02X ", before_mode, after_mode);
             
-            // 打印模式名称
+            // Print mode name
             printf("(");
             switch(before_mode) {
                 case 0x10: printf("USR"); break;
@@ -443,20 +443,20 @@ void print_report(RegChangeInfo *regs_info, CpsrChangeInfo *cpsr_info, RegisterS
 
 int init_memory_monitor(PmuCounter *pmu) {
     struct perf_event_attr attr = {0};
-    attr.type = 8;
-    attr.size = sizeof(attr);
-    attr.disabled = 1;
-    attr.exclude_kernel = 1;
-    attr.exclude_hv = 1;
-    attr.pinned = 1;
-    // attr.exclusive = 1;
+    attr.type = 8;            // PERF_TYPE_HARDWARE
+    attr.size = sizeof(attr); // Size of the event attribute structure
+    attr.disabled = 1;        // Disable the event initially
+    attr.exclude_kernel = 1;  // Exclude kernel events
+    attr.exclude_hv = 1;      // Exclude hypervisor events
+    attr.pinned = 1;          // Pin the event to a specific CPU
+    // attr.exclusive = 1;     // Exclusive event
     
-    attr.config = 0x0006;
+    attr.config = 0x0006;     // Event configuration
     pmu->ld_retired_fd = perf_event_open(&attr, 0, 1, -1, 0);
     if (pmu->ld_retired_fd == -1) {
         printf("LD_RETIRED失败: %s\n", strerror(errno));
         
-        // 尝试不绑定CPU
+        // Try to unbind CPU
         pmu->ld_retired_fd = perf_event_open(&attr, 0, -1, -1, 0);
         printf("不绑定CPU的LD_RETIRED: %s (fd=%d)\n", 
                pmu->ld_retired_fd != -1 ? "OK" : "FAIL", pmu->ld_retired_fd);
@@ -467,7 +467,7 @@ int init_memory_monitor(PmuCounter *pmu) {
     if (pmu->st_retired_fd == -1) {
         printf("ST_RETIRED失败: %s\n", strerror(errno));
         
-        // 尝试不绑定CPU
+        // Try to unbind CPU
         pmu->st_retired_fd = perf_event_open(&attr, 0, -1, -1, 0);
         printf("不绑定CPU的ST_RETIRED: %s (fd=%d)\n", 
                pmu->st_retired_fd != -1 ? "OK" : "FAIL", pmu->st_retired_fd);
@@ -494,82 +494,82 @@ int init_insn_page(void) {
     return 0;
 }
 
-// 只测试Load退休指令
+// Test Load retired only
 uint64_t test_load_only(uint8_t *insn_bytes, size_t insn_length)
 {
     if (g_pmu.ld_retired_fd <= 0) {
         return 0;
     }
 
-    // 预先准备测试指令
+    // Prepare test instruction
     memcpy(insn_page + insn_offset * 4, insn_bytes, insn_length);
     __clear_cache(insn_page, insn_page + insn_test_plate_length);
 
     uint64_t result = 0;
     executing_insn = 1;
 
-    // 获取函数指针
+    // Get function pointer
     void (*exec_page)() = (void(*)()) insn_page;
 
-    // 重置和启用LD计数器
+    // Reset and enable LD counter
     ioctl(g_pmu.ld_retired_fd, PERF_EVENT_IOC_RESET, 0);
     ioctl(g_pmu.ld_retired_fd, PERF_EVENT_IOC_ENABLE, 0);
 
-    // 内存屏障
+    // Memory barrier
     asm volatile("dsb" ::: "memory");
 
-    // 执行测试指令
+    // Execute test instruction
     exec_page();
 
-    // 内存屏障
+    // Memory barrier
     asm volatile("dsb" ::: "memory");
 
-    // 禁用LD计数器
+    // Disable LD counter
     ioctl(g_pmu.ld_retired_fd, PERF_EVENT_IOC_DISABLE, 0);
 
     executing_insn = 0;
     
-    // 读取结果
+    // Read result
     read(g_pmu.ld_retired_fd, &result, sizeof(uint64_t));
     return result;
 }
 
-// 只测试Store退休指令
+// Test Store retired only
 uint64_t test_store_only(uint8_t *insn_bytes, size_t insn_length)
 {
     if (g_pmu.st_retired_fd <= 0) {
         return 0;
     }
 
-    // 预先准备测试指令
+    // Prepare test instruction
     memcpy(insn_page + insn_offset * 4, insn_bytes, insn_length);
     __clear_cache(insn_page, insn_page + insn_test_plate_length);
 
     uint64_t result = 0;
     executing_insn = 1;
 
-    // 获取函数指针
+    // Get function pointer
     void (*exec_page)() = (void(*)()) insn_page;
 
-    // 重置和启用ST计数器
+    // Reset and enable ST counter
     ioctl(g_pmu.st_retired_fd, PERF_EVENT_IOC_RESET, 0);
     ioctl(g_pmu.st_retired_fd, PERF_EVENT_IOC_ENABLE, 0);
 
-    // 内存屏障
+    // Memory barrier
     asm volatile("dsb" ::: "memory");
 
-    // 执行测试指令
+    // Execute test instruction
     exec_page();
 
-    // 内存屏障
+    // Memory barrier
     asm volatile("dsb" ::: "memory");
 
-    // 禁用ST计数器
+    // Disable ST counter
     ioctl(g_pmu.st_retired_fd, PERF_EVENT_IOC_DISABLE, 0);
 
     executing_insn = 0;
     
-    // 读取结果
+    // Read result
     read(g_pmu.st_retired_fd, &result, sizeof(uint64_t));
     return result;
 }
@@ -582,38 +582,38 @@ void test_load_store(uint8_t *insn_bytes, size_t insn_length, TestResult *result
         return;
     }
 
-    // 预先准备测试指令
+    // Prepare test instruction
     memcpy(insn_page + insn_offset * 4, insn_bytes, insn_length);
     __clear_cache(insn_page, insn_page + insn_test_plate_length);
 
     executing_insn = 1;
 
-    // 获取函数指针
+    // Get function pointer
     void (*exec_page)() = (void(*)()) insn_page;
 
-    // 重置和启用ST计数器
+    // Reset and enable ST counter
     ioctl(g_pmu.ld_retired_fd, PERF_EVENT_IOC_RESET, 0);
     ioctl(g_pmu.ld_retired_fd, PERF_EVENT_IOC_ENABLE, 0);
 
     ioctl(g_pmu.st_retired_fd, PERF_EVENT_IOC_RESET, 0);
     ioctl(g_pmu.st_retired_fd, PERF_EVENT_IOC_ENABLE, 0);
 
-    // 内存屏障
+    // Memory barrier
     asm volatile("dsb" ::: "memory");
 
-    // 执行测试指令
+    // Execute test instruction
     exec_page();
 
-    // 内存屏障
+    // Memory barrier
     asm volatile("dsb" ::: "memory");
 
-    // 禁用ST计数器
+    // Disable ST counter
     ioctl(g_pmu.ld_retired_fd, PERF_EVENT_IOC_DISABLE, 0);
     ioctl(g_pmu.st_retired_fd, PERF_EVENT_IOC_DISABLE, 0);
 
     executing_insn = 0;
     
-    // 读取结果
+    // Read result
     read(g_pmu.ld_retired_fd, &result->ld_count, sizeof(uint64_t));
     read(g_pmu.st_retired_fd, &result->st_count, sizeof(uint64_t));
 }
@@ -635,38 +635,38 @@ size_t fill_insn_buffer(uint8_t *buf, size_t buf_size, uint32_t insn)
 void print_test_result(uint32_t instruction, TestResult *result) {
     printf("测试指令: 0x%08X", instruction);
     
-    // 基准值：nop指令的背景噪声
-    uint64_t base_ld = 73; // 17
-    uint64_t base_st = 28; // 5
+    // Base value: background noise of nop instruction
+    uint64_t base_ld = 73; // 17 hardcoded
+    uint64_t base_st = 28; // 5 hardcoded
     
-    // 计算相对于基准的增量
+    // Calculate the increment relative to the base
     int64_t ld_delta = result->ld_count - base_ld;
     int64_t st_delta = result->st_count - base_st;
     
     printf(" | LD:%llu(%+lld) ST:%llu(%+lld)", 
            result->ld_count, ld_delta, result->st_count, st_delta);
     
-    // 判断指令类型
+    // Determine the instruction type
     if (ld_delta == 0 && st_delta == 0) {
-        printf(" -> 不涉及内存访问");
+        printf(" -> No memory access");
     } else if (ld_delta == 1 && st_delta == 0) {
-        printf(" -> LDR指令(单次加载)");
+        printf(" -> LDR instruction (single load)");
     } else if (ld_delta == 0 && st_delta == 1) {
-        printf(" -> STR指令(单次存储)");
+        printf(" -> STR instruction (single store)");
     } else if (ld_delta == 1 && st_delta == 1) {
-        printf(" -> 同时加载+存储指令");
+        printf(" -> Load + Store instruction");
     } else if (ld_delta == 2 && st_delta == 0) {
-        printf(" -> 双次加载指令");
+        printf(" -> Double load instruction");
     } else if (ld_delta == 0 && st_delta == 2) {
-        printf(" -> 双次存储指令");
+        printf(" -> Double store instruction");
     } else if (ld_delta > 0 && st_delta == 0) {
-        printf(" -> 多次加载指令(%lld次)", ld_delta);
+        printf(" -> Multiple load instructions (%lld times)", ld_delta);
     } else if (ld_delta == 0 && st_delta > 0) {
-        printf(" -> 多次存储指令(%lld次)", st_delta);
+        printf(" -> Multiple store instructions (%lld times)", st_delta);
     } else if (ld_delta > 0 && st_delta > 0) {
-        printf(" -> 复合访存指令(LD:%lld, ST:%lld)", ld_delta, st_delta);
+        printf(" -> Compound memory access instruction (LD:%lld, ST:%lld)", ld_delta, st_delta);
     } else {
-        printf(" -> 异常情况(LD:%lld, ST:%lld)", ld_delta, st_delta);
+        printf(" -> Exceptional case (LD:%lld, ST:%lld)", ld_delta, st_delta);
     }
     
     printf("\n");
@@ -674,10 +674,9 @@ void print_test_result(uint32_t instruction, TestResult *result) {
 
 int main(int argc, const char* argv[]) {
     set_affinity();
-    // uint32_t hidden_instruction = 0xE58D0000;  // str r0, [sp] - 应该只涉及1个store
     
     uint32_t test_instructions[] = {
-        // === 不涉及内存访问的指令 ===
+        // === Instructions that do not involve memory access ===
         0xE1A00000,  // nop (mov r0, r0)
         0xE3A00001,  // mov r0, #1
         0xE0800001,  // add r0, r0, r1  
@@ -689,112 +688,113 @@ int main(int argc, const char* argv[]) {
         0xE1A01080,  // mov r1, r0, lsl #1
         0xE3500000,  // cmp r0, #0
         
-        // === 单次内存访问指令 ===
+        // === Single memory access instruction ===
         0xE59D0000,  // ldr r0, [sp]        - 1次load
         0xE59D0004,  // ldr r0, [sp, #4]    - 1次load  
         0xE58D0000,  // str r0, [sp]        - 1次store
         0xE58D0004,  // str r0, [sp, #4]    - 1次store
         
-        // === 更多安全的Load指令（使用sp基址）===
+        // === More secure Load instructions (using sp base address) ===
         0xE59D0008,  // ldr r0, [sp, #8]    - load sp+8
         0xE59D000C,  // ldr r0, [sp, #12]   - load sp+12
         0xE59D0010,  // ldr r0, [sp, #16]   - load sp+16
-        0xE59D1000,  // ldr r1, [sp]        - load到r1
-        0xE59D1004,  // ldr r1, [sp, #4]    - load到r1+偏移
-        0xE59D2000,  // ldr r2, [sp]        - load到r2
-        0xE51D0004,  // ldr r0, [sp, #-4]   - load sp-4（负偏移）
+        0xE59D1000,  // ldr r1, [sp]        - load to r1
+        0xE59D1004,  // ldr r1, [sp, #4]    - load to r1+offset
+        0xE59D2000,  // ldr r2, [sp]        - load to r2
+        0xE51D0004,  // ldr r0, [sp, #-4]   - load sp-4 (negative offset)
         0xE51D0008,  // ldr r0, [sp, #-8]   - load sp-8
         
-        // === 更多安全的Store指令（使用sp基址）===
+        // === More secure Store instructions (using sp base address) ===
         0xE58D0008,  // str r0, [sp, #8]    - store sp+8
         0xE58D000C,  // str r0, [sp, #12]   - store sp+12
         0xE58D0010,  // str r0, [sp, #16]   - store sp+16
-        0xE58D1000,  // str r1, [sp]        - store r1到栈
-        0xE58D1004,  // str r1, [sp, #4]    - store r1+偏移
-        0xE58D2000,  // str r2, [sp]        - store r2到栈
-        0xE50D0004,  // str r0, [sp, #-4]   - store sp-4（负偏移）
+        0xE58D1000,  // str r1, [sp]        - store r1 to stack
+        0xE58D1004,  // str r1, [sp, #4]    - store r1+offset
+        0xE58D2000,  // str r2, [sp]        - store r2 to stack
+        0xE50D0004,  // str r0, [sp, #-4]   - store sp-4 (negative offset)
         0xE50D0008,  // str r0, [sp, #-8]   - store sp-8
         
-        // === 字节访存（使用sp基址，更安全）===
-        0xE5DD0000,  // ldrb r0, [sp]       - 字节load
-        0xE5DD0001,  // ldrb r0, [sp, #1]   - 字节load+1
-        0xE5DD0002,  // ldrb r0, [sp, #2]   - 字节load+2
-        0xE5CD0000,  // strb r0, [sp]       - 字节store
-        0xE5CD0001,  // strb r0, [sp, #1]   - 字节store+1
-        0xE5CD0002,  // strb r0, [sp, #2]   - 字节store+2
+        // === Byte memory access (using sp base address, more secure) ===
+        0xE5DD0000,  // ldrb r0, [sp]       - byte load
+        0xE5DD0001,  // ldrb r0, [sp, #1]   - byte load+1
+        0xE5DD0002,  // ldrb r0, [sp, #2]   - byte load+2
+        0xE5CD0000,  // strb r0, [sp]       - byte store
+        0xE5CD0001,  // strb r0, [sp, #1]   - byte store+1
+        0xE5CD0002,  // strb r0, [sp, #2]   - byte store+2
 
-        // 添加一些调试指令来验证异常
-        0xE58D0000,  // str r0, [sp]     - 对比：应该ST+1
-        0xE58D1000,  // str r1, [sp]     - 异常：显示ST+2  
-        0xE58D2000,  // str r2, [sp]     - 测试：是否也ST+2？
+        // Add some debug instructions to verify exceptions
+        0xE58D0000,  // str r0, [sp]     - Compare: should ST+1
+        0xE58D1000,  // str r1, [sp]     - Exception: show ST+2  
+        0xE58D2000,  // str r2, [sp]     - Test: is ST+2?
 
-        // 测试寄存器初始化的影响
-        0xE3A01000,  // mov r1, #0       - 先初始化r1
-        0xE58D1000,  // str r1, [sp]     - 再测试存储
+        // Test the effect of register initialization
+        0xE3A01000,  // mov r1, #0       - Initialize r1 first
+        0xE58D1000,  // str r1, [sp]     - Then test store
         0xE1A08003,  // MOV  r8, r3
         0xE1A09004,  // MOV  r9, r4
-        0xE181A00B,  // ORR  r10,r1,r11           (r10 发生变化, 不影响 NZCV)
+        0xE181A00B,  // ORR  r10,r1,r11           (r10 changes, but NZCV is unchanged)
         0xE1A0B006,  // MOV  r11,r6
         0xE1A0C002,  // MOV  r12,r2
 
-        0xE1B00000,  // MOVS r0,r0                (只改标志位, 无访存)
-        0xE2926001,  // ADDS r6,r2,#1             (改 r6 和 NZCV)
-        0xE2537001,  // SUBS r7,r3,#1             (改 r7 和 NZCV)
-        0xE1B0A004,  // MOVS r10,r4               (改 r10, 也刷新 NZCV)
-        0xE1520003,  // CMP  r2,r3                (仅改 NZCV, 不写通用寄存器)
+        0xE1B00000,  // MOVS r0,r0                (Only change flags, no memory access)
+        0xE2926001,  // ADDS r6,r2,#1             (Change r6 and NZCV)
+        0xE2537001,  // SUBS r7,r3,#1             (Change r7 and NZCV)
+        0xE1B0A004,  // MOVS r10,r4               (Change r10, also refresh NZCV)
+        0xE1520003,  // CMP  r2,r3                (only change NZCV, no general register)
 
-        0xE0C34597,  // UMULL r4,r5,r7,r7         (r4,r5 同时改变, NZCV=unchanged)
+        0xE0C34597,  // UMULL r4,r5,r7,r7         (r4,r5 change, NZCV=unchanged)
         0xE0E24597,  // UMLALS r4,r5,r7,r7        (r4,r5 + NZCV)
-        0xE0A14692,  // ADC   r4,r1,r2            (改 r4 + NZCV, 依赖进位)
+        0xE0A14692,  // ADC   r4,r1,r2            (change r4 + NZCV, depend on carry)
 
-        // 0xE8BD000F,  // LDMIA sp!,{r0-r3}         (r0-r3,sp 改变，4 次 load)
-        // 0xE92D00F0,  // STMDB sp!,{r4-r7}         (r4-r7,sp 改变，4 次 store)
-        // 0xE8BD10F0,  // LDMIA sp!,{r4-r7,lr}      (r4-r7,lr,sp；5 次 load)
-        // 0xE92D400F,  // STMDB sp!,{r0-r3,lr}      (r0-r3,lr,sp；5 次 store)
+        // 0xE8BD000F,  // LDMIA sp!,{r0-r3}         (r0-r3,sp change, 4 times load)
+        // 0xE92D00F0,  // STMDB sp!,{r4-r7}         (r4-r7,sp change, 4 times store)
+        // 0xE8BD10F0,  // LDMIA sp!,{r4-r7,lr}      (r4-r7,lr,sp; 5 times load)
+        // 0xE92D400F,  // STMDB sp!,{r0-r3,lr}      (r0-r3,lr,sp; 5 times store)
 
-        0xE10F1000,  // MRS  r1,cpsr              (读 CPSR → r1，改 r1)
-        0xE121F001,  // MSR  cpsr_flg,r1          (写 NZCVQP 标志；**可能触 SIGILL**)
+        0xE10F1000,  // MRS  r1,cpsr              (read CPSR → r1, change r1)
+        0xE121F001,  // MSR  cpsr_flg,r1          (write NZCVQP flag; **may trigger SIGILL**)
 
-        // === 中断控制指令 ===
-        0xF10C01C0,  // CPSID i                   (禁用IRQ中断)
-        0xF10C0140,  // CPSID f                   (禁用FIQ中断) 
-        0xF10C01C0,  // CPSID i,f                 (同时禁用IRQ和FIQ)
-        0xF10801C0,  // CPSIE i                   (启用IRQ中断)
-        0xF1080140,  // CPSIE f                   (启用FIQ中断)
-        0xF10801C0,  // CPSIE i,f                 (同时启用IRQ和FIQ)
+        // === Interrupt
+        0xF10C01C0,  // CPSID i                   (disable IRQ interrupt)
+        0xF10C0140,  // CPSID f                   (disable FIQ interrupt) 
+        0xF10C01C0,  // CPSID i,f                 (disable IRQ and FIQ)
+        0xF10801C0,  // CPSIE i                   (enable IRQ interrupt)
+        0xF1080140,  // CPSIE f                   (enable FIQ interrupt)
+        0xF10801C0,  // CPSIE i,f                 (enable IRQ and FIQ)
         
-        // === 模式切换指令 ===
-        0xF1020011,  // CPS #0x11                 (切换到FIQ模式)
-        0xF1020012,  // CPS #0x12                 (切换到IRQ模式) 
-        0xF1020013,  // CPS #0x13                 (切换到SVC模式)
-        0xF1020017,  // CPS #0x17                 (切换到ABT模式)
-        0xF102001B,  // CPS #0x1B                 (切换到UND模式)
-        0xF102001F,  // CPS #0x1F                 (切换到SYS模式)
-        0xF1020010,  // CPS #0x10                 (切换到USR模式)
+        // === Mode switch instruction ===
+        0xF1020011,  // CPS #0x11                 (switch to FIQ mode)
+        0xF1020012,  // CPS #0x12                 (switch to IRQ mode) 
+        0xF1020013,  // CPS #0x13                 (switch to SVC mode)
+        0xF1020017,  // CPS #0x17                 (switch to ABT mode)
+        0xF102001B,  // CPS #0x1B                 (switch to UND mode)
+        0xF102001F,  // CPS #0x1F                 (switch to SYS mode)
+        0xF1020010,  // CPS #0x10                 (switch to USR mode)
         
-        // === MSR指令用于修改CPSR的各个字段 ===
-        0xE121F001,  // MSR cpsr_c, r1            (修改CPSR控制字段，包括模式位)
-        0xE128F001,  // MSR cpsr_f, r1            (修改CPSR标志字段)
-        0xE124F001,  // MSR cpsr_s, r1            (修改CPSR状态字段)
-        0xE122F001,  // MSR cpsr_x, r1            (修改CPSR扩展字段)
-        0xE12FF001,  // MSR cpsr_cxsf, r1         (修改CPSR所有字段)
+        // === MSR instruction to modify CPSR fields ===
+        0xE121F001,  // MSR cpsr_c, r1            (modify CPSR control field, including mode bit)
+        0xE128F001,  // MSR cpsr_f, r1            (modify CPSR flag field)
+        0xE124F001,  // MSR cpsr_s, r1            (modify CPSR status field)
+        0xE122F001,  // MSR cpsr_x, r1            (modify CPSR extension field)
+        0xE12FF001,  // MSR cpsr_cxsf, r1         (modify CPSR all fields)
         
-        // === 具体的中断控制值 ===
-        0xE321F0C0,  // MSR cpsr_c, #0xC0         (直接设置IRQ+FIQ禁用位)
-        0xE321F080,  // MSR cpsr_c, #0x80         (直接设置IRQ禁用位)
-        0xE321F040,  // MSR cpsr_c, #0x40         (直接设置FIQ禁用位)
-        0xE321F000,  // MSR cpsr_c, #0x00         (清除IRQ+FIQ禁用位)
+        // === Specific interrupt control values ===
+        0xE321F0C0,  // MSR cpsr_c, #0xC0         (set IRQ+FIQ disable bit directly)
+        0xE321F080,  // MSR cpsr_c, #0x80         (set IRQ disable bit directly)
+        0xE321F040,  // MSR cpsr_c, #0x40         (set FIQ disable bit directly)
+        0xE321F000,  // MSR cpsr_c, #0x00         (clear IRQ+FIQ disable bit directly)
         
-        // === 模式切换组合 ===
-        0xE321F0D3,  // MSR cpsr_c, #0xD3         (SVC模式 + IRQ+FIQ禁用)
-        0xE321F0D1,  // MSR cpsr_c, #0xD1         (FIQ模式 + IRQ+FIQ禁用)
-        0xE321F0D2,  // MSR cpsr_c, #0xD2         (IRQ模式 + IRQ+FIQ禁用)
-        0xE321F05F,  // MSR cpsr_c, #0x5F         (系统模式 + IRQ+FIQ启用)
-        
-        // === 软件中断指令 ===
-        0xEF000001,  // SWI #1                     (软件中断调用)
-        0xEF000010,  // SWI #16                    (软件中断调用)
-        0xEF0000FF,  // SWI #255                   (软件中断调用)
+        // === Mode switch combination ===
+        0xE321F0D3,  // MSR cpsr_c, #0xD3         (SVC mode + IRQ+FIQ disable)
+        0xE321F0D1,  // MSR cpsr_c, #0xD1         (FIQ mode + IRQ+FIQ disable)
+        0xE321F0D2,  // MSR cpsr_c, #0xD2         (IRQ mode + IRQ+FIQ disable)
+        0xE321F05F,  // MSR cpsr_c, #0x5F         (SYS mode + IRQ+FIQ enable)
+    
+
+        0xf3f57010,  // VSHR.U32 D23, D0, #11  
+        0xf2000110,  // VMOV.I32 D0, #0        (NEON immediate load)
+        0xf3f57010,  // VSHR.U32 D23, D0, #11  
+        0xf2200110,  // VADD.I32 D0, D0, D0    (NEON addition)
     };
 
     int shmid = shmget(IPC_PRIVATE, sizeof(RegisterStates) * 2, IPC_CREAT | 0666);
