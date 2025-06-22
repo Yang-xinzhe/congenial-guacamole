@@ -13,8 +13,24 @@
 #include <unistd.h>
 #include <sched.h>
 #include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 #define MY_SIGSTKSZ 8192
+
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t opcode;
+    // behavior 字段 bit 分配
+    // [7:0]   - 基础行为分类 (8 bit)
+    // [20:8]  - 寄存器变化详情 (13 bit) 
+    // [22:21] - SP/LR 变化 (2 bit)
+    // [24:23] - CPSR 安全级别 (2 bit)
+    // [28:25] - 异常信号类型 (4 bit)
+    // [31:29] - 预留扩展 (3 bit)
+    uint32_t behavior;
+} InstrBehavior;        // 8 bytes
+#pragma pack(pop)
 
 typedef __attribute__((aligned(4))) struct {
     uint32_t r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12;
@@ -107,22 +123,6 @@ void set_affinity(){
     mlockall(MCL_CURRENT | MCL_FUTURE);
 }
 
-// void test_instruction(void)
-// {
-//     asm volatile(
-//         ".global insn_test_plate_begin \n"
-//         "insn_test_plate_begin:\n"
-
-//         ".global insn_location \n"
-//         "insn_location: \n"
-//         "nop \n"
-
-//         "bx lr \n"
-
-//         ".global insn_test_plate_end \n"
-//         "insn_test_plate_end: \n"
-//         :::);
-// }
 
 void test_instruction(void)
 {
@@ -672,336 +672,62 @@ void print_test_result(uint32_t instruction, TestResult *result) {
     printf("\n");
 }
 
+static uint32_t pack_behavior(RegChangeInfo *regs, CpsrChangeInfo *cpsr, TestResult *test){
+    uint32_t behavior = 0;
 
-const char* analyze_instruction_type(uint32_t instruction, TestResult *result, 
-                                    RegChangeInfo *regs_info, CpsrChangeInfo *cpsr_info,
-                                    int signal_num) {
-    static char type_buffer[256];
-    char details[128] = "";
-    
-    uint64_t base_ld = 73, base_st = 28;
-    int64_t ld_delta = result->ld_count - base_ld;
-    int64_t st_delta = result->st_count - base_st;
-    
-    // 基础指令类型判断
-    if (signal_num != 0) {
-        snprintf(type_buffer, sizeof(type_buffer), "PRIVILEGED/UNDEFINED");
-    } else if (ld_delta > 0 && st_delta > 0) {
-        snprintf(type_buffer, sizeof(type_buffer), "COMPOUND_MEMORY");
-        snprintf(details, sizeof(details), "LD:%lld+ST:%lld", ld_delta, st_delta);
-    } else if (ld_delta > 0) {
-        if (ld_delta == 1) snprintf(type_buffer, sizeof(type_buffer), "LOAD_SINGLE");
-        else snprintf(type_buffer, sizeof(type_buffer), "LOAD_MULTIPLE");
-        snprintf(details, sizeof(details), "count:%lld", ld_delta);
-    } else if (st_delta > 0) {
-        if (st_delta == 1) snprintf(type_buffer, sizeof(type_buffer), "STORE_SINGLE");
-        else snprintf(type_buffer, sizeof(type_buffer), "STORE_MULTIPLE");
-        snprintf(details, sizeof(details), "count:%lld", st_delta);
-    } else if (regs_info->changed_regs != 0 || regs_info->SP || regs_info->LR) {
-        snprintf(type_buffer, sizeof(type_buffer), "COMPUTATIONAL");
-    } else if (cpsr_info->changed_mask != 0) {
-        snprintf(type_buffer, sizeof(type_buffer), "STATUS_CONTROL");
-    } else {
-        snprintf(type_buffer, sizeof(type_buffer), "NOP_LIKE");
-    }
-    
-    if (strlen(details) > 0) {
-        strncat(type_buffer, " (", sizeof(type_buffer) - strlen(type_buffer) - 1);
-        strncat(type_buffer, details, sizeof(type_buffer) - strlen(type_buffer) - 1);
-        strncat(type_buffer, ")", sizeof(type_buffer) - strlen(type_buffer) - 1);
-    }
-    
-    return type_buffer;
-}
+    uint64_t base_ld = 73;
+    uint64_t base_st = 28;
+    int64_t ld_delta = test->ld_count - base_ld;
+    int64_t st_delta = test->st_count - base_st;
 
-// 安全级别的颜色和描述
-const char* get_security_level_desc(CpsrChangeInfo *cpsr_info) {
-    switch(cpsr_info->security_level) {
-        case SAFE: return "SAFE";
-        case SUSPICIOUS: return "SUSPICIOUS";
-        case DANGEROUS: return "DANGEROUS";
-        case CRITICAL: return "CRITICAL";
-        default: return "UNKNOWN";
-    }
-}
+    if (ld_delta > 0)     behavior |= 1u << 0;
+    if (st_delta > 0)     behavior |= 1u << 1;
+    if (regs->changed_regs)     behavior |= 1u << 2;
+    if (regs->SP || regs->LR)   behavior |= 1u << 3;
 
-int get_display_width(const char *s) {
-    int width = 0;
-    while (*s) {
-        if (*s & 0x80) { // A simple check for multi-byte characters
-            width += 2;
-            s += 3; // Assuming UTF-8 where Chinese characters are 3 bytes
-        } else {
-            width += 1;
-            s++;
+    if (cpsr->changed_mask != 0) {
+        switch (cpsr->security_level) {
+            case SAFE:          behavior |= 1u << 4; break;
+            case SUSPICIOUS:    behavior |= 1u << 5; break;
+            case DANGEROUS:     behavior |= 1u << 6; break;
+            case CRITICAL:      behavior |= 1u << 7; break;
         }
     }
-    return width;
-}
 
-void print_comprehensive_report(uint32_t instruction, RegChangeInfo *regs_info, 
-                               CpsrChangeInfo *cpsr_info, RegisterStates *before, 
-                               RegisterStates *after, TestResult *result, int test_index) {
-    
-    const int total_width = 77;
-    
-    printf("\n┌─────────────────────────────────────────────────────────────────────────────┐\n");
-    char header[80];
-    snprintf(header, sizeof(header), " TEST #%-4d | ARM指令行为完整性分析报告", test_index);
-    printf("│%-*s           │\n", total_width, header);
-    printf("├─────────────────────────────────────────────────────────────────────────────┤\n");
-    
-    // 1. 指令基本信息
-    char inst_code[80];
-    snprintf(inst_code, sizeof(inst_code), " 指令编码: 0x%08X", instruction);
-    printf("│%-*s    │\n", total_width, inst_code);
-    
-    const char* inst_type = analyze_instruction_type(instruction, result, regs_info, cpsr_info, last_insn_signum);
-    char inst_type_info[80];
-    snprintf(inst_type_info, sizeof(inst_type_info), " 指令类型: %s", inst_type);
-    int padding = total_width - get_display_width(inst_type_info);
-    printf("│%s%*s│\n", inst_type_info, padding > 0 ? padding : 0, "");
-    
-    // 2. 异常信息
-    if (last_insn_signum != 0) {
-        char signal_info[80];
-        snprintf(signal_info, sizeof(signal_info), " 异常信号: %s (%d)", strsignal(last_insn_signum), last_insn_signum);
-        printf("│%-*s│\n", total_width, signal_info);
-        
-        const char* signal_desc = "";
-        switch(last_insn_signum) {
-            case SIGILL: signal_desc = "未定义指令或特权指令"; break;
-            case SIGSEGV: signal_desc = "内存访问违规"; break;
-            case SIGTRAP: signal_desc = "调试陷阱"; break;
-            case SIGBUS: signal_desc = "总线错误"; break;
-            default: signal_desc = "其他异常";
-        }
-        char signal_desc_info[80];
-        snprintf(signal_desc_info, sizeof(signal_desc_info), " 异常描述: %s", signal_desc);
-        padding = total_width - get_display_width(signal_desc_info);
-        printf("│%s%*s│\n", signal_desc_info, padding > 0 ? padding : 0, "");
-    } else {
-        char signal_info[80] = " 异常信号: 无";
-        padding = total_width - get_display_width(signal_info);
-        printf("│%s%*s│\n", signal_info, padding > 0 ? padding : 0, "");
-    }
-    
-    printf("├─────────────────────────────────────────────────────────────────────────────┤\n");
-    
-    // 3. 寄存器变化分析
-    char reg_analysis_title[] = " 寄存器变化分析:";
-    padding = total_width - get_display_width(reg_analysis_title);
-    printf("│%s%*s│\n", reg_analysis_title, padding > 0 ? padding : 0, "");
-    
-    int reg_change_count = 0;
-    uint32_t *before_regs = (uint32_t*)before;
-    uint32_t *after_regs = (uint32_t*)after;
-    
-    // 通用寄存器变化
-    if (regs_info->changed_regs != 0) {
-        char title[] = "   通用寄存器变化:";
-        padding = total_width - get_display_width(title);
-        printf("│%s%*s│\n", title, padding > 0 ? padding : 0, "");
+    // (bit 8-20, 13 bit)
+    behavior |= (regs->changed_regs & 0x1FFF)       << 8;   // 13 bit
+    // (bit 21-22)
+    if (regs->SP) behavior |= 1u << 21;
+    if (regs->LR) behavior |= 1u << 22;
 
-        for(int i = 0; i < 13; i++) {
-            if(regs_info->changed_regs & (1 << i)) {
-                char reg_change[100];
-                snprintf(reg_change, sizeof(reg_change), 
-                        "     R%-2d: 0x%08X → 0x%08X  (变化: 0x%08X)", 
-                        i, before_regs[i], after_regs[i], 
-                        (uint32_t)(after_regs[i] - before_regs[i]));
-                printf("│%-*s│\n", total_width, reg_change);
-                reg_change_count++;
-            }
-        }
-    }
-    
-    // 特殊寄存器变化
-    if (regs_info->SP || regs_info->LR) {
-        char title[] = "   特殊寄存器变化:";
-        padding = total_width - get_display_width(title);
-        printf("│%s%*s│\n", title, padding > 0 ? padding : 0, "");
+    // (bit 23-24)
+    behavior |= (cpsr->security_level & 0x3) << 23;
 
-        if (regs_info->SP) {
-            char sp_change[100];
-            snprintf(sp_change, sizeof(sp_change), 
-                    "     SP:  0x%08X → 0x%08X  (变化: 0x%08X)", 
-                    before->sp, after->sp, (uint32_t)(after->sp - before->sp));
-            printf("│%-*s│\n", total_width, sp_change);
-            reg_change_count++;
-        }
-        if (regs_info->LR) {
-            char lr_change[100];
-            snprintf(lr_change, sizeof(lr_change), 
-                    "     LR:  0x%08X → 0x%08X  (变化: 0x%08X)", 
-                    before->lr, after->lr, (uint32_t)(after->lr - before->lr));
-            printf("│%-*s│\n", total_width, lr_change);
-            reg_change_count++;
-        }
+    // (bit 25-28)
+    uint32_t signal_type = 0;
+    switch (last_insn_signum) {
+        case 0:       signal_type = 0; break;
+        case SIGILL:  signal_type = 1; break;
+        case SIGSEGV: signal_type = 2; break;
+        case SIGBUS:  signal_type = 3; break;
+        case SIGTRAP: signal_type = 4; break;
+        default:      signal_type = 15; break;
     }
-    
-    if (reg_change_count == 0) {
-        char no_change[] = "   无寄存器变化";
-        padding = total_width - get_display_width(no_change);
-        printf("│%s%*s│\n", no_change, padding > 0 ? padding : 0, "");
-    }
-    
-    printf("├─────────────────────────────────────────────────────────────────────────────┤\n");
-    
-    // 4. CPSR状态分析
-    char cpsr_analysis_title[] = " CPSR状态分析:";
-    padding = total_width - get_display_width(cpsr_analysis_title);
-    printf("│%s%*s│\n", cpsr_analysis_title, padding > 0 ? padding : 0, "");
-    
-    if (cpsr_info->changed_mask != 0) {
-        char cpsr_change[100];
-        snprintf(cpsr_change, sizeof(cpsr_change), 
-                "   CPSR变化: 0x%08X → 0x%08X", 
-                cpsr_info->before_value, cpsr_info->after_value);
-        printf("│%-*s│\n", total_width, cpsr_change);
-        
-        if (cpsr_info->N || cpsr_info->Z || cpsr_info->C || cpsr_info->V) {
-            char flag_changes[100] = "   条件标志位变化: ";
-            if (cpsr_info->N) strcat(flag_changes, "N ");
-            if (cpsr_info->Z) strcat(flag_changes, "Z ");
-            if (cpsr_info->C) strcat(flag_changes, "C ");
-            if (cpsr_info->V) strcat(flag_changes, "V ");
-            printf("│%-*s│\n", total_width, flag_changes);
-        }
-        
-        if (cpsr_info->M) {
-            char mode_change[120] = "   处理器模式变化: ";
-            uint32_t before_mode = cpsr_info->before_value & 0x1F;
-            uint32_t after_mode = cpsr_info->after_value & 0x1F;
-            
-            const char* mode_names[] = {"USR", "FIQ", "IRQ", "SVC", "", "", "", "ABT", "", "", "", "UND", "", "", "", "", "SYS"};
-            char b_mode_str[8], a_mode_str[8];
+    behavior |= (signal_type & 0xF) << 25;
 
-            if(before_mode <= 0x1F && before_mode >= 0x10 && strlen(mode_names[before_mode-0x10]) > 0)
-                strcat(mode_change, mode_names[before_mode-0x10]);
-            else {
-                snprintf(b_mode_str, sizeof(b_mode_str), "0x%X", before_mode);
-                strcat(mode_change, b_mode_str);
-            }
-
-            strcat(mode_change, " → ");
-
-            if(after_mode <= 0x1F && after_mode >= 0x10 && strlen(mode_names[after_mode-0x10]) > 0)
-                 strcat(mode_change, mode_names[after_mode-0x10]);
-            else {
-                snprintf(a_mode_str, sizeof(a_mode_str), "0x%X", after_mode);
-                strcat(mode_change, a_mode_str);
-            }
-            padding = total_width - get_display_width(mode_change);
-            printf("│%s%*s│\n", mode_change, padding > 0 ? padding : 0, "");
-        }
-        
-        if (cpsr_info->I || cpsr_info->F) {
-            char irq_change[100] = "   中断控制变化: ";
-            if (cpsr_info->I) strcat(irq_change, "IRQ ");
-            if (cpsr_info->F) strcat(irq_change, "FIQ ");
-            padding = total_width - get_display_width(irq_change);
-            printf("│%s%*s│\n", irq_change, padding > 0 ? padding : 0, "");
-        }
-        
-        char security_level[100];
-        snprintf(security_level, sizeof(security_level), 
-                "   安全级别: %s", get_security_level_desc(cpsr_info));
-        padding = total_width - get_display_width(security_level);
-        printf("│%s%*s│\n", security_level, padding > 0 ? padding : 0, "");
-    } else {
-        char no_change[] = "   无CPSR变化";
-        padding = total_width - get_display_width(no_change);
-        printf("│%s%*s│\n", no_change, padding > 0 ? padding : 0, "");
-    }
-    
-    printf("├─────────────────────────────────────────────────────────────────────────────┤\n");
-    
-    // 5. 内存访问行为分析
-    char mem_analysis_title[] = " 内存访问行为分析:";
-    padding = total_width - get_display_width(mem_analysis_title);
-    printf("│%s%*s│\n", mem_analysis_title, padding > 0 ? padding : 0, "");
-    
-    uint64_t base_ld = 73, base_st = 28;
-    int64_t ld_delta = result->ld_count - base_ld;
-    int64_t st_delta = result->st_count - base_st;
-    
-    char pmu_info[100];
-    snprintf(pmu_info, sizeof(pmu_info), 
-            "   PMU计数器: LD=%llu(%+lld) ST=%llu(%+lld)", 
-            result->ld_count, ld_delta, result->st_count, st_delta);
-    printf("│%-*s   │\n", total_width, pmu_info);
-    
-    if (ld_delta == 0 && st_delta == 0) {
-        char no_mem_access[] = "   内存行为: 无内存访问";
-        padding = total_width - get_display_width(no_mem_access);
-        printf("│%s%*s│\n", no_mem_access, padding > 0 ? padding : 0, "");
-    } else {
-        if (ld_delta > 0) {
-            char load_info[100];
-            snprintf(load_info, sizeof(load_info), "   Load行为: %lld次内存读取", ld_delta);
-            padding = total_width - get_display_width(load_info);
-            printf("│%s%*s│\n", load_info, padding > 0 ? padding : 0, "");
-        }
-        if (st_delta > 0) {
-            char store_info[100];
-            snprintf(store_info, sizeof(store_info), "   Store行为: %lld次内存写入", st_delta);
-            padding = total_width - get_display_width(store_info);
-            printf("│%s%*s│\n", store_info, padding > 0 ? padding : 0, "");
-        }
-        
-        if (st_delta == 1 && ((instruction & 0xFE000000) == 0xFE000000 || 
-                              (instruction & 0xF0000000) == 0xF0000000)) {
-            char special_note[] = "   特殊说明: VFP/NEON协处理器初始化导致的上下文保存";
-            padding = total_width - get_display_width(special_note);
-            printf("│%s%*s│\n", special_note, padding > 0 ? padding : 0, "");
-        }
-    }
-    
-    printf("├─────────────────────────────────────────────────────────────────────────────┤\n");
-    
-    // 6. 综合评估
-    char eval_title[] = " 综合评估:";
-    padding = total_width - get_display_width(eval_title);
-    printf("│%s%*s│\n", eval_title, padding > 0 ? padding : 0, "");
-    
-    int complexity_score = 0;
-    if (reg_change_count > 0) complexity_score += reg_change_count;
-    if (cpsr_info->changed_mask != 0) complexity_score += 2;
-    if (ld_delta > 0) complexity_score += ld_delta;
-    if (st_delta > 0) complexity_score += st_delta;
-    if (last_insn_signum != 0) complexity_score += 5;
-    
-    char complexity_info[80];
-    snprintf(complexity_info, sizeof(complexity_info), "   功能复杂度: %d", complexity_score);
-    printf("│%-*s     │\n", total_width, complexity_info);
-    
-    const char* risk_level_str;
-    char risk_level_info[100];
-    if (last_insn_signum != 0) {
-        risk_level_str = "高 (触发异常)";
-    } else if (cpsr_info->security_level >= DANGEROUS) {
-        risk_level_str = "高 (系统状态变化)";
-    } else if (cpsr_info->security_level == SUSPICIOUS) {
-        risk_level_str = "中 (执行状态变化)";
-    } else {
-        risk_level_str = "低";
-    }
-    snprintf(risk_level_info, sizeof(risk_level_info), "   安全风险: %s", risk_level_str);
-    padding = total_width - get_display_width(risk_level_info);
-    printf("│%s%*s│\n", risk_level_info, padding > 0 ? padding : 0, "");
-    
-    char classification[100];
-    snprintf(classification, sizeof(classification), "   指令分类: %s", inst_type);
-    padding = total_width - get_display_width(classification);
-    printf("│%s%*s│\n", classification, padding > 0 ? padding : 0, "");
-    
-    printf("└─────────────────────────────────────────────────────────────────────────────┘\n");
+    // bit 29-31 reserved
+    return behavior;
 }
 
 int main(int argc, const char* argv[]) {
     set_affinity();
     
+    int result_fd = open("result.bin", O_CREAT | O_APPEND | O_WRONLY | O_SYNC, 0666);
+    if(result_fd < 0) {
+        perror("open result bin failed");
+        return 1;
+    }
+
     uint32_t test_instructions[] = {
         // === Instructions that do not involve memory access ===
         0xE1A00000,  // nop (mov r0, r0)
@@ -1143,7 +869,20 @@ int main(int argc, const char* argv[]) {
         return 1;
     }
 
-    
+    if(init_insn_page() != 0) {
+        printf("init_insn_page failed\n");
+        return 1;
+    }
+
+    if(init_memory_monitor(&g_pmu) != 0) {
+        printf("PMU initial failed!\n");
+    }
+
+    uint8_t nop_bytes[4] = {0x00, 0x00, 0xA0, 0xE1}; // nop 指令
+    TestResult warmup_result;
+    for(int i = 0; i < 5; i++) {
+        test_load_store(nop_bytes, 4, &warmup_result);
+    }
 
     int total_tests = sizeof(test_instructions) / sizeof(test_instructions[0]);
     for(int i = 0 ; i < total_tests ; i++) {
@@ -1152,15 +891,6 @@ int main(int argc, const char* argv[]) {
 
         // printf("=== ARM隐藏指令PMU精确分析 ===\n");
         // printf("测试指令: 0x%08X\n", hidden_instruction);
-
-        if(init_insn_page() != 0) {
-            printf("init_insn_page failed\n");
-            return 1;
-        }
-
-        if(init_memory_monitor(&g_pmu) != 0) {
-            printf("PMU initial failed!\n");
-        }
 
         size_t buf_length = fill_insn_buffer(insn_bytes,sizeof(insn_bytes), hidden_instruction);
         
@@ -1182,15 +912,26 @@ int main(int argc, const char* argv[]) {
         RegChangeInfo regs_info = detect_reg_changes(regs_before, regs_after);
         CpsrChangeInfo cpsr_info = detect_cpsr_changes(regs_before, regs_after);
 
-        printf("===================================\n");
-        print_report(&regs_info, &cpsr_info, regs_before, regs_after);
-        print_test_result(hidden_instruction, &result);
-        printf("===================================\n");
-        printf("\n");
+        // printf("===================================\n");
+        // print_report(&regs_info, &cpsr_info, regs_before, regs_after);
+        // print_test_result(hidden_instruction, &result);
+        // printf("===================================\n");
+        // printf("\n");
 
+        InstrBehavior ib = {
+            .opcode = hidden_instruction,
+            .behavior = pack_behavior(&regs_info, &cpsr_info, &result)
+        };
 
-        if (g_pmu.ld_retired_fd > 0) close(g_pmu.ld_retired_fd);
-        if (g_pmu.st_retired_fd > 0) close(g_pmu.st_retired_fd);
+        if(write(result_fd, &ib, sizeof(ib)) != sizeof(ib)) {
+            perror("write result bin");
+        }    
     }
+    if (g_pmu.ld_retired_fd > 0) close(g_pmu.ld_retired_fd);
+    if (g_pmu.st_retired_fd > 0) close(g_pmu.st_retired_fd);
+    if (insn_page != MAP_FAILED) {
+        munmap(insn_page, 4096);
+    }
+    close(result_fd);
     return 0;
 }
