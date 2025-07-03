@@ -11,8 +11,10 @@
 #include <sys/stat.h>
 #include <stdint.h>
 #include <sched.h>
+#include <sys/time.h> 
 
 #define TIMEOUT_SECONDS 1  // 每条指令的超时时间
+#define TIMEOUT_MS 500
 #define MAX_RANGES 500000
 #define MAX_TIMEOUT_INSTRUCTIONS 100000  // 最大超时指令数
 #define MAX_CPUS 4  // 最大CPU核心数
@@ -157,12 +159,24 @@ int execute_single_check(int file_number, uint32_t instruction) {
         current_child_pid = pid;
         timeout_occurred = 0;
         
-        alarm(TIMEOUT_SECONDS);
+        struct itimerval timer;
+        timer.it_value.tv_sec = TIMEOUT_MS / 1000;      // 0秒
+        timer.it_value.tv_usec = (TIMEOUT_MS % 1000) * 1000;  // 500000微秒
+        timer.it_interval.tv_sec = 0;   // 不重复
+        timer.it_interval.tv_usec = 0;
+        
+        setitimer(ITIMER_REAL, &timer, NULL);
+
+        // alarm(TIMEOUT_SECONDS);
         
         int status;
         pid_t result = waitpid(pid, &status, 0);
         
-        alarm(0);  // 取消alarm
+        // alarm(0);  // 取消alarm
+        timer.it_value.tv_sec = 0;
+        timer.it_value.tv_usec = 0;
+        setitimer(ITIMER_REAL, &timer, NULL);
+
         current_child_pid = 0;
         
         if (timeout_occurred) {
@@ -209,7 +223,7 @@ int process_single_file(int file_number, int cpu_id) {
     
     // 读取res文件
     char input_filename[256];
-    snprintf(input_filename, sizeof(input_filename), "results_A32/res%d.txt", file_number);
+    snprintf(input_filename, sizeof(input_filename), "result/res%d.txt", file_number);
     
     FILE *res_file = fopen(input_filename, "r");
     if (!res_file) {
