@@ -94,6 +94,18 @@ uint32_t insn_offset;
 uint32_t insn_test_plate_length;
 void test_instruction(void) __attribute__((optimize("O0")));
 
+// static uint8_t sig_stack_array[MY_SIGSTKSZ];
+// stack_t sig_stack = {
+//     .ss_size = MY_SIGSTKSZ,
+//     .ss_sp = sig_stack_array,
+// };
+static uint8_t sig_stack_array[64 * 1024] __attribute__((aligned(16)));
+stack_t sig_stack = {
+    .ss_sp   = sig_stack_array,
+    .ss_size = sizeof(sig_stack_array),
+    .ss_flags = 0,
+};
+
 typedef struct {
     int ld_retired_fd;      // Load retired
     int st_retired_fd;      // Store retired
@@ -110,6 +122,46 @@ static int perf_event_open(struct perf_event_attr *hw_event,
                            pid_t pid, int cpu, int group_fd, unsigned long flags) {
     return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
 }
+
+void signal_handler(int sig_num, siginfo_t *sig_info, void *uc_ptr)
+{
+    // Suppress unused warning
+    (void)sig_info;
+
+    ucontext_t* uc = (ucontext_t*) uc_ptr;
+
+    last_insn_signum = sig_num;
+
+
+    if (executing_insn == 0) {
+        // Something other than a hidden insn execution raised the signal,
+        // so quit
+        fprintf(stderr, "%s\n", strsignal(sig_num));
+        exit(1);
+    }
+
+    // Jump to the next instruction (i.e. skip the illegal insn)
+    uintptr_t insn_skip = (uintptr_t)(insn_page) + (insn_offset+1)*4;
+    insn_skip = (insn_skip + 3) & ~3;
+    //aarch32
+    uc->uc_mcontext.arm_pc = insn_skip;
+
+}
+
+void init_signal_handler(void (*handler)(int, siginfo_t*, void*), int signum)
+{
+    // sigaltstack(&sig_stack, NULL);
+    if (sigaltstack(&sig_stack, NULL) == -1) perror("sigaltstack");
+    struct sigaction s = {
+        .sa_sigaction = handler,
+        .sa_flags = SA_SIGINFO | SA_ONSTACK,
+    };
+
+    sigfillset(&s.sa_mask);
+
+    sigaction(signum,  &s, NULL);
+}
+
 
 void set_affinity(){
     cpu_set_t cpuset;
@@ -129,21 +181,7 @@ void test_instruction(void)
     asm volatile(
         ".global insn_test_plate_begin \n"
         "insn_test_plate_begin:\n"
-
-        // "mov r0, #0x55 \n"
-        // "orr r0, r0, r0, lsl #8 \n"   // r0 = 0x5555
-        // "orr r0, r0, r0, lsl #16 \n"  // r0 = 0x55555555
-        // "mov r1, r0 \n"
-        // "mov r2, r0 \n"
-        // "mov r3, r0 \n"
-        // "mov r4, r0 \n"
-        // "mov r5, r0 \n"
-        // "mov r6, r0 \n"
-        // "mov r7, r0 \n"
-        // "mov r8, r0 \n"
-        // "mov r9, r0 \n"
-        // "mov r10, r0 \n"
-        // "mov r12, r0 \n"
+        
         "mov r0, #0 \n"
         "ldr r1, =0x11111111 \n"
         "ldr r2, =0x22222222 \n"
@@ -584,6 +622,7 @@ void test_load_store(uint8_t *insn_bytes, size_t insn_length, TestResult *result
 
     // Prepare test instruction
     memcpy(insn_page + insn_offset * 4, insn_bytes, insn_length);
+    last_insn_signum = 0;
     __clear_cache(insn_page, insn_page + insn_test_plate_length);
 
     executing_insn = 1;
@@ -878,55 +917,91 @@ int main(int argc, const char* argv[]) {
         printf("PMU initial failed!\n");
     }
 
+    init_signal_handler(signal_handler, SIGILL);
+    init_signal_handler(signal_handler, SIGSEGV);
+    init_signal_handler(signal_handler, SIGTRAP);
+    init_signal_handler(signal_handler, SIGBUS);
+
     uint8_t nop_bytes[4] = {0x00, 0x00, 0xA0, 0xE1}; // nop 指令
     TestResult warmup_result;
     for(int i = 0; i < 5; i++) {
         test_load_store(nop_bytes, 4, &warmup_result);
     }
 
-    int total_tests = sizeof(test_instructions) / sizeof(test_instructions[0]);
-    for(int i = 0 ; i < total_tests ; i++) {
-        uint32_t hidden_instruction = test_instructions[i];
-        uint8_t insn_bytes[4];
-
-        // printf("=== ARM隐藏指令PMU精确分析 ===\n");
-        // printf("测试指令: 0x%08X\n", hidden_instruction);
-
-        size_t buf_length = fill_insn_buffer(insn_bytes,sizeof(insn_bytes), hidden_instruction);
-        
-        RegisterStates *regs_before = (RegisterStates *)res;
-        RegisterStates *regs_after = (RegisterStates *)res + 1;
-
-        TestResult result = {0};
-        
-        // printf("\n[第1步] 测试Load退休指令...\n");
-        // result.ld_count = test_load_only(insn_bytes, buf_length);
-        // printf("Load计数: %llu\n", result.ld_count);
-        
-        // printf("\n[第2步] 测试Store退休指令...\n");
-        // result.st_count = test_store_only(insn_bytes, buf_length);
-        // printf("Store计数: %llu\n", result.st_count);
-        
-        test_load_store(insn_bytes, buf_length, &result);
-
-        RegChangeInfo regs_info = detect_reg_changes(regs_before, regs_after);
-        CpsrChangeInfo cpsr_info = detect_cpsr_changes(regs_before, regs_after);
-
-        // printf("===================================\n");
-        // print_report(&regs_info, &cpsr_info, regs_before, regs_after);
-        // print_test_result(hidden_instruction, &result);
-        // printf("===================================\n");
-        // printf("\n");
-
-        InstrBehavior ib = {
-            .opcode = hidden_instruction,
-            .behavior = pack_behavior(&regs_info, &cpsr_info, &result)
-        };
-
-        if(write(result_fd, &ib, sizeof(ib)) != sizeof(ib)) {
-            perror("write result bin");
-        }    
+    FILE *range_file = fopen("res0_ranges.txt", "r");
+    if(range_file == NULL){
+        perror("open ranges file failed");
+        return 1;
     }
+    char line[256];
+    uint32_t range_start, range_end;
+    uint32_t total_instructions_tested = 0;
+    uint32_t total_ranges_processed = 0;
+    
+    while(fgets(line, sizeof(line), range_file)){
+        if(sscanf(line, "[0x%X, 0x%X)", &range_start, &range_end) == 2){
+            total_ranges_processed++;
+            // printf("Processing %u: [0x%08x, 0x%08x]\n", total_ranges_processed, range_start, range_end);
+
+            uint32_t range_instruction_count = 0;
+
+            for(uint32_t hidden_instruction = range_start; hidden_instruction < range_end ; hidden_instruction++){
+                uint8_t insn_bytes[4];
+
+                // printf("=== ARM隐藏指令PMU精确分析 ===\n");
+                // printf("测试指令: 0x%08X\n", hidden_instruction);
+
+                size_t buf_length = fill_insn_buffer(insn_bytes,sizeof(insn_bytes), hidden_instruction);
+                
+                RegisterStates *regs_before = (RegisterStates *)res;
+                RegisterStates *regs_after = (RegisterStates *)res + 1;
+
+                TestResult result = {0};
+                
+                // printf("\n[第1步] 测试Load退休指令...\n");
+                // result.ld_count = test_load_only(insn_bytes, buf_length);
+                // printf("Load计数: %llu\n", result.ld_count);
+                
+                // printf("\n[第2步] 测试Store退休指令...\n");
+                // result.st_count = test_store_only(insn_bytes, buf_length);
+                // printf("Store计数: %llu\n", result.st_count);
+                
+                test_load_store(insn_bytes, buf_length, &result);
+
+                RegChangeInfo regs_info = detect_reg_changes(regs_before, regs_after);
+                CpsrChangeInfo cpsr_info = detect_cpsr_changes(regs_before, regs_after);
+
+                // printf("===================================\n");
+                // print_report(&regs_info, &cpsr_info, regs_before, regs_after);
+                // print_test_result(hidden_instruction, &result);
+                // printf("===================================\n");
+                // printf("\n");
+
+                InstrBehavior ib = {
+                    .opcode = hidden_instruction,
+                    .behavior = pack_behavior(&regs_info, &cpsr_info, &result)
+                };
+
+                if(ib.behavior != 0) {
+                    if(write(result_fd, &ib, sizeof(ib)) != sizeof(ib)) {
+                        perror("write result bin");
+                    }
+                }
+                total_instructions_tested++;
+                    
+                // 每测试1000条指令显示一次进度
+                if (total_instructions_tested % 10000 == 0) {
+                    printf("已测试 %u 条指令...\n", total_instructions_tested);
+                }
+            }
+
+        }
+    }
+
+    // int total_tests = sizeof(test_instructions) / sizeof(test_instructions[0]);
+    // for(int i = 0 ; i < total_tests ; i++) {
+    //     uint32_t hidden_instruction = test_instructions[i];
+    
     if (g_pmu.ld_retired_fd > 0) close(g_pmu.ld_retired_fd);
     if (g_pmu.st_retired_fd > 0) close(g_pmu.st_retired_fd);
     if (insn_page != MAP_FAILED) {
