@@ -366,7 +366,7 @@ void execute_insn_page(uint8_t *insn_bytes, size_t insn_length)
     alarm_triggered = 0;
     alarm(1);
 
-    arm_watchdog_us(200); 
+    arm_watchdog_us(200);
     // Jump to the instruction to be tested (and execute it)
     exec_page();
 
@@ -423,9 +423,9 @@ int main(int argc, char* argv[]){
     snprintf(file_num_env, sizeof(file_num_env), "%d", file_number);
     setenv("RESULT_FILE_NUMBER", file_num_env, 1);
     
-    printf("处理文件: res%d.txt\n", target_file_num);
-
     time_t start_time = time(NULL);
+    
+    printf("[res%d] 处理文件: res%d.txt\n", file_number, target_file_num);
     init_signal_handler(signal_handler, SIGILL);
     init_signal_handler(signal_handler, SIGSEGV);
     init_signal_handler(signal_handler, SIGTRAP);
@@ -465,10 +465,10 @@ int main(int argc, char* argv[]){
     }
     fclose(res_file);
     
-    printf("从 %s 读取到 %d 个区间\n", input_filename, range_count);
+    printf("[res%d] 从 %s 读取到 %d 个区间\n", file_number, input_filename, range_count);
     
     if(range_count == 0) {
-        printf("文件中没有找到有效区间\n");
+        printf("[res%d] 文件中没有找到有效区间\n", file_number);
         munmap(insn_page, PAGE_SIZE);
         return 0;
     }
@@ -504,19 +504,21 @@ int main(int argc, char* argv[]){
     int timeout_range_count = 0; // 实际写入的timeout区间数
     fwrite(&timeout_range_count, sizeof(int), 1, timeout_file); // 先写0，稍后更新
     
+    // 计算总指令数用于总进度计算
+    uint64_t total_insns = 0;
+    for(int r = 0; r < range_count; r++) {
+        total_insns += (ranges[r].end - ranges[r].start);
+    }
+    
     // 处理每个区间
     for(int r = 0; r < range_count; r++) {
         uint32_t range_start = ranges[r].start;
         uint32_t range_end = ranges[r].end;
         
-        // 简化输出，减少printf调用
-        if(r % 10000 == 0 || r == range_count - 1) {
-            printf("处理区间 %d/%d: [%u, %u]\n", r+1, range_count, range_start, range_end);
-        }
-        
         // 为每个区间初始化bitmap
         if (init_bitmap(range_start, range_end) != 0) {
-            fprintf(stderr, "init bitmap failed for range [%u, %u]\n", range_start, range_end);
+            fprintf(stderr, "\n[res%d] init bitmap failed for range [%u, %u]\n", 
+                    file_number, range_start, range_end);
             continue;
         }
         
@@ -529,19 +531,16 @@ int main(int argc, char* argv[]){
             size_t buf_length = fill_insn_buffer(insn_bytes, sizeof(insn_bytes), hidden_insn);
             
             execute_insn_page(insn_bytes, buf_length);
-            
+
             if (last_insn_signum == SIGILL) {
-                // printf("0x%x SIGILL\n", i);
-                // sigill_cnt++;
+                sigill_cnt++;
             } else if (last_insn_signum == SIGSEGV) {
-                // printf("0x%x SIGSEGV\n", i);
-                // sigsegv_cnt++;
+                sigsegv_cnt++;
             } else if (last_insn_signum == SIGBUS) {
-                // sigbus_cnt++;
+                sigbus_cnt++;
             } else if (last_insn_signum == SIGTRAP) {
-                // sigtrap_cnt++;
+                sigtrap_cnt++;
             } else if (last_insn_signum == SIGALRM || last_insn_signum == SIGPROF) {
-                printf("0x%x SIGALRM (timeout)\n", i);
                 sigalrm_cnt++;
                 mark_timeout(hidden_insn);  // 标记到timeout_bitmap
             } else{
@@ -549,6 +548,18 @@ int main(int argc, char* argv[]){
                 mark_executable(hidden_insn); 
             }
             instructions_checked++;
+            
+            // 每处理1000条指令更新一次进度（避免刷新过于频繁）
+            if (instructions_checked % 1000 == 0 || i == range_end - 1) {
+                float overall_progress = (float)instructions_checked / total_insns * 100.0;
+                float range_progress = (float)(i - range_start + 1) / (range_end - range_start) * 100.0;
+                int elapsed = time(NULL) - start_time;
+                
+                printf("\r[res%d] 总进度:%.1f%% 区间:%d/%d(%.0f%%) 已检查:%u 超时:%u 可执行:%u 用时:%ds   ",
+                       file_number, overall_progress, r+1, range_count, range_progress,
+                       instructions_checked, sigalrm_cnt, no_signal, elapsed);
+                fflush(stdout);
+            }
         }
         
         // 将这个区间的bitmap追加到文件
@@ -565,17 +576,20 @@ int main(int argc, char* argv[]){
     fclose(timeout_file);
     save_complete_file_results(range_count);
     
-    printf("实际写入 %d 个包含超时指令的区间\n", timeout_range_count);
+    // 完成后换行，避免覆盖进度条
+    printf("\n");
+    printf("[res%d] ===== 处理完成 =====\n", file_number);
+    printf("[res%d] Total insn numbers (checked): %d \n", file_number, instructions_checked);
+    printf("[res%d] SIGILL: %d\n", file_number, sigill_cnt);
+    printf("[res%d] SIGSEGV: %d\n", file_number, sigsegv_cnt);
+    printf("[res%d] SIGBUS: %d\n", file_number, sigbus_cnt);
+    printf("[res%d] SIGTRAP: %d\n", file_number, sigtrap_cnt);
+    printf("[res%d] SIGALRM (timeout): %d\n", file_number, sigalrm_cnt);
+    printf("[res%d] No signal (executable): %d\n", file_number, no_signal);
+    printf("[res%d] 实际写入 %d 个包含超时指令的区间\n", file_number, timeout_range_count);
+    printf("[res%d] 总用时: %ld 秒\n", file_number, time(NULL) - start_time);
     
     munmap(insn_page, PAGE_SIZE);
-    printf("Total insn numbers (checked):%d \n", instructions_checked);
-    printf("SIGILL: %d\n", sigill_cnt);
-    printf("SIGSEGV: %d\n", sigsegv_cnt);
-    printf("SIGBUS: %d\n", sigbus_cnt);
-    printf("SIGTRAP: %d\n", sigtrap_cnt);
-    printf("SIGALRM (timeout): %d\n", sigalrm_cnt);
-    printf("No signal (executable): %d\n", no_signal);
-
     return 0;
         
 }
