@@ -25,6 +25,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <sys/time.h>
+#include <setjmp.h>
+#include <sys/syscall.h>
+#include <pthread.h>
 
 
 #define SIGSEGV_THRESHOLD 10
@@ -37,9 +40,13 @@
 void *insn_page;
 volatile sig_atomic_t last_insn_signum = 0;
 volatile sig_atomic_t executing_insn = 0;
-volatile sig_atomic_t alarm_triggered = 0;
+volatile sig_atomic_t timeout_occurred = 0;
 uint32_t insn_offset = 0;
 uint32_t mask = 0x1111;
+
+// 新增：逃生点和精准定时器
+static sigjmp_buf escape_env;
+static timer_t watchdog_timer;
 
 static uint8_t sig_stack_array[MY_SIGSTKSZ];
 stack_t sig_stack = {
@@ -79,22 +86,40 @@ struct Range {
     uint32_t end;
 };
 
-static inline void arm_watchdog_us(int us) {
-    struct itimerval it = {0};
-    it.it_value.tv_sec  = 0;
-    it.it_value.tv_usec = us;
-    setitimer(ITIMER_REAL, &it, NULL);
-    setitimer(ITIMER_PROF, &it, NULL); // 使用ITIMER_REAL产生SIGALRM
-}
-static inline void disarm_watchdog() {
-    struct itimerval it = {0};
-    setitimer(ITIMER_REAL, &it, NULL);
-    setitimer(ITIMER_PROF, &it, NULL);
+// 获取线程ID（用于 SIGEV_THREAD_ID）
+static pid_t gettid_wrapper(void) {
+    return syscall(SYS_gettid);
 }
 
-void alarm_handler(int sig) {
-    (void)sig;
-    alarm_triggered = 1;
+// 初始化精准定时器（timer_create + SIGEV_THREAD_ID）
+int init_watchdog_timer(void) {
+    struct sigevent sev;
+    memset(&sev, 0, sizeof(sev));
+    sev.sigev_notify = SIGEV_THREAD_ID;
+    sev.sigev_signo = SIGRTMIN;  // 使用实时信号
+    sev._sigev_un._tid = gettid_wrapper();  // 指定线程ID（某些系统用这个字段名）
+    
+    if (timer_create(CLOCK_MONOTONIC, &sev, &watchdog_timer) != 0) {
+        perror("timer_create failed");
+        return -1;
+    }
+    return 0;
+}
+
+// 启动看门狗（微秒级超时）
+static inline void arm_watchdog_us(int us) {
+    struct itimerspec its = {
+        .it_value.tv_sec = 0,
+        .it_value.tv_nsec = us * 1000,
+        .it_interval = {0, 0}  // 不重复
+    };
+    timer_settime(watchdog_timer, 0, &its, NULL);
+}
+
+// 停止看门狗
+static inline void disarm_watchdog(void) {
+    struct itimerspec its = {{0, 0}, {0, 0}};
+    timer_settime(watchdog_timer, 0, &its, NULL);
 }
 
 int init_bitmap(uint32_t start, uint32_t end) {
@@ -218,6 +243,21 @@ void save_complete_file_results(int total_ranges) {
 }
 
 
+// 超时信号专用 handler（只做 longjmp，不改 PC）
+void timeout_signal_handler(int sig_num, siginfo_t *sig_info, void *uc_ptr) {
+    (void)sig_num;
+    (void)sig_info;
+    (void)uc_ptr;
+    
+    timeout_occurred = 1;
+    
+    // 直接跳回安全点，不依赖 ucontext
+    if (executing_insn) {
+        siglongjmp(escape_env, 1);
+    }
+}
+
+// 普通信号 handler（SIGILL/SIGSEGV/SIGBUS/SIGTRAP）
 void signal_handler(int sig_num, siginfo_t *sig_info, void *uc_ptr)
 {
     // Suppress unused warning
@@ -238,21 +278,40 @@ void signal_handler(int sig_num, siginfo_t *sig_info, void *uc_ptr)
     // Jump to the next instruction (i.e. skip the illegal insn)
     uintptr_t insn_skip = (uintptr_t)(insn_page) + (insn_offset+1)*4;
 
-    //aarch32
+    // ARM32架构下才设置PC（避免编译错误）
+#if defined(__arm__)
     uc->uc_mcontext.arm_pc = insn_skip;
-
+#else
+    (void)uc;  // 避免未使用警告
+    // 非ARM平台用 siglongjmp 作为备用
+    siglongjmp(escape_env, sig_num);
+#endif
 }
 
+// 初始化超时信号 handler（专门配置，不同于普通信号）
+void init_timeout_signal_handler(void (*handler)(int, siginfo_t*, void*), int signum) {
+    sigaltstack(&sig_stack, NULL);
+    
+    struct sigaction s = {
+        .sa_sigaction = handler,
+        .sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER,  // 注意：去掉SA_RESTART，加上SA_NODEFER
+    };
+    
+    sigemptyset(&s.sa_mask);  // 不屏蔽其他信号
+    sigaction(signum, &s, NULL);
+}
+
+// 初始化普通信号 handler（保留原有逻辑）
 void init_signal_handler(void (*handler)(int, siginfo_t*, void*), int signum)
 {
     sigaltstack(&sig_stack, NULL);
 
     struct sigaction s = {
         .sa_sigaction = handler,
-        .sa_flags = SA_SIGINFO | SA_ONSTACK,
+        .sa_flags = SA_SIGINFO | SA_ONSTACK,  // 去掉 SA_RESTART
     };
 
-    sigfillset(&s.sa_mask);
+    sigemptyset(&s.sa_mask);  // 改为不填满，避免屏蔽超时信号
 
     sigaction(signum,  &s, NULL);
 }
@@ -341,45 +400,44 @@ int init_insn_page(void)
     return 0;
 }
 
+// 执行指令页（核心改进：使用 sigsetjmp/siglongjmp）
 void execute_insn_page(uint8_t *insn_bytes, size_t insn_length)
 {
-    // Jumps to the instruction buffer
     void (*exec_page)() = (void(*)()) insn_page;
-
     
-
-    // Update the first instruction in the instruction buffer
+    // 更新指令缓冲区
     memcpy(insn_page + insn_offset * 4, insn_bytes, insn_length);
-
+    
     last_insn_signum = 0;
-
-    /*
-     * Clear insn_page (at the insn to be tested + the msr insn before)
-     * in the d- and icache
-     * (some instructions might be skipped otherwise.)
-     */
+    timeout_occurred = 0;
+    
+    // 清除 i-cache 和 d-cache
     __clear_cache(insn_page + (insn_offset-1) * 4,
                   insn_page + insn_offset * 4 + insn_length);
-
-    executing_insn = 1;
-
-    alarm_triggered = 0;
-    alarm(1);
-
-    arm_watchdog_us(200);
-    // Jump to the instruction to be tested (and execute it)
-    exec_page();
-
-    disarm_watchdog();
-    alarm(0);
-
-    if (alarm_triggered) {
-        last_insn_signum = SIGALRM;
-    }
-
-    executing_insn = 0;
-
     
+    executing_insn = 1;
+    
+    // ========== 关键改进：设置逃生点 ==========
+    if (sigsetjmp(escape_env, 1) == 0) {
+        // 第一次执行：启动看门狗并执行指令
+        arm_watchdog_us(200);  // 200微秒超时
+        
+        exec_page();  // 执行指令
+        
+        // 正常返回
+        disarm_watchdog();
+    } else {
+        // 从 siglongjmp 跳回（超时或其他信号）
+        disarm_watchdog();
+        
+        // 如果是超时导致的
+        if (timeout_occurred) {
+            last_insn_signum = SIGALRM;  // 统一标记为超时
+        }
+        // 否则 last_insn_signum 已被普通 signal_handler 设置
+    }
+    
+    executing_insn = 0;
 }
 
 
@@ -413,8 +471,6 @@ int main(int argc, char* argv[]){
         return 1;
     }
 
-    signal(SIGALRM, alarm_handler);
-
     // 直接读取文件模式
     int target_file_num = atoi(argv[1]);
     file_number = target_file_num;
@@ -426,16 +482,34 @@ int main(int argc, char* argv[]){
     time_t start_time = time(NULL);
     
     printf("[res%d] 处理文件: res%d.txt\n", file_number, target_file_num);
+    
+    // ========== 确保信号未被屏蔽 ==========
+    sigset_t empty_set;
+    sigemptyset(&empty_set);
+    pthread_sigmask(SIG_SETMASK, &empty_set, NULL);
+    
+    // ========== 初始化信号处理器 ==========
+    // 1. 普通异常信号（SIGILL/SIGSEGV/SIGBUS/SIGTRAP）
     init_signal_handler(signal_handler, SIGILL);
     init_signal_handler(signal_handler, SIGSEGV);
     init_signal_handler(signal_handler, SIGTRAP);
     init_signal_handler(signal_handler, SIGBUS);
-    init_signal_handler(signal_handler, SIGALRM); 
-    init_signal_handler(signal_handler, SIGPROF);
-
+    
+    // 2. 超时信号（专用handler，使用实时信号）
+    init_timeout_signal_handler(timeout_signal_handler, SIGRTMIN);
+    
+    // 3. 备用：SIGVTALRM（针对用户态忙等）
+    init_timeout_signal_handler(timeout_signal_handler, SIGVTALRM);
+    
+    // ========== 初始化精准定时器 ==========
+    if (init_watchdog_timer() != 0) {
+        fprintf(stderr, "Failed to initialize watchdog timer\n");
+        return 1;
+    }
 
     if (init_insn_page() != 0) {
         perror("insn_page mmap failed");
+        timer_delete(watchdog_timer);
         return 1;
     }
 
@@ -588,6 +662,9 @@ int main(int argc, char* argv[]){
     printf("[res%d] No signal (executable): %d\n", file_number, no_signal);
     printf("[res%d] 实际写入 %d 个包含超时指令的区间\n", file_number, timeout_range_count);
     printf("[res%d] 总用时: %ld 秒\n", file_number, time(NULL) - start_time);
+    
+    // 清理定时器
+    timer_delete(watchdog_timer);
     
     munmap(insn_page, PAGE_SIZE);
     return 0;
