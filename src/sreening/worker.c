@@ -37,6 +37,7 @@
 
 #define PAGE_SIZE 4096
 #define MY_SIGSTKSZ 8192
+static void *insn_region = NULL;  // 3页区域基址： [guard][code][guard]
 void *insn_page;
 volatile sig_atomic_t last_insn_signum = 0;
 volatile sig_atomic_t executing_insn = 0;
@@ -377,16 +378,25 @@ void execution_boilerplate(void)
 
 int init_insn_page(void)
 {
-    // Allocate an executable page / memory region
-    insn_page = mmap(NULL,
-                       PAGE_SIZE,
-                       PROT_READ | PROT_WRITE | PROT_EXEC,
+    // 申请3页：左右为guard page (PROT_NONE)，中间为指令页
+    insn_region = mmap(NULL,
+                       PAGE_SIZE * 3,
+                       PROT_NONE,
                        MAP_PRIVATE | MAP_ANONYMOUS,
                        -1,
                        0);
 
-    if (insn_page == MAP_FAILED)
+    if (insn_region == MAP_FAILED)
         return 1;
+
+    // 中间页作为真正的指令页
+    insn_page = (uint8_t*)insn_region + PAGE_SIZE;
+
+    // 临时设为 RWX 以便写入样板代码
+    if (mprotect(insn_page, PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        munmap(insn_region, PAGE_SIZE * 3);
+        return 1;
+    }
 
     uint32_t boilerplate_length = (&boilerplate_end - &boilerplate_start) / 4;
 
@@ -397,13 +407,25 @@ int init_insn_page(void)
 
     insn_offset = (&insn_location - &boilerplate_start) / 4;
 
+    // 写入完成后立刻切回 RX（只读可执行）
+    if (mprotect(insn_page, PAGE_SIZE, PROT_READ | PROT_EXEC) != 0) {
+        munmap(insn_region, PAGE_SIZE * 3);
+        return 1;
+    }
+
     return 0;
 }
 
-// 执行指令页（核心改进：使用 sigsetjmp/siglongjmp）
+// 执行指令页（核心改进：使用 sigsetjmp/siglongjmp + RX权限保护）
 void execute_insn_page(uint8_t *insn_bytes, size_t insn_length)
 {
     void (*exec_page)() = (void(*)()) insn_page;
+    
+    // 为写入指令临时开放写权限（RWX）
+    if (mprotect(insn_page, PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        perror("mprotect RWX failed");
+        return;
+    }
     
     // 更新指令缓冲区
     memcpy(insn_page + insn_offset * 4, insn_bytes, insn_length);
@@ -415,6 +437,12 @@ void execute_insn_page(uint8_t *insn_bytes, size_t insn_length)
     __clear_cache(insn_page + (insn_offset-1) * 4,
                   insn_page + insn_offset * 4 + insn_length);
     
+    // 执行前立刻切回 RX（只读可执行），禁止自写或向 PC 附近写
+    if (mprotect(insn_page, PAGE_SIZE, PROT_READ | PROT_EXEC) != 0) {
+        perror("mprotect RX failed");
+        return;
+    }
+    
     executing_insn = 1;
     
     // ========== 关键改进：设置逃生点 ==========
@@ -422,7 +450,7 @@ void execute_insn_page(uint8_t *insn_bytes, size_t insn_length)
         // 第一次执行：启动看门狗并执行指令
         arm_watchdog_us(200);  // 200微秒超时
         
-        exec_page();  // 执行指令
+        exec_page();  // 执行指令（若跑出页或写PC附近会SIGSEGV）
         
         // 正常返回
         disarm_watchdog();
@@ -438,6 +466,11 @@ void execute_insn_page(uint8_t *insn_bytes, size_t insn_length)
     }
     
     executing_insn = 0;
+    
+    // 恢复为 RWX，方便下一条指令写入（可选优化：也可保持RX，下次写入时再开）
+    if (mprotect(insn_page, PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        perror("mprotect restore RWX failed");
+    }
 }
 
 
@@ -520,7 +553,7 @@ int main(int argc, char* argv[]){
     FILE *res_file = fopen(input_filename, "r");
     if(!res_file) {
         fprintf(stderr, "无法打开文件 %s: %s\n", input_filename, strerror(errno));
-        munmap(insn_page, PAGE_SIZE);
+        munmap(insn_region, PAGE_SIZE * 3);
         return 1;
     }
     
@@ -543,7 +576,7 @@ int main(int argc, char* argv[]){
     
     if(range_count == 0) {
         printf("[res%d] 文件中没有找到有效区间\n", file_number);
-        munmap(insn_page, PAGE_SIZE);
+        munmap(insn_region, PAGE_SIZE * 3);
         return 0;
     }
     
@@ -555,7 +588,7 @@ int main(int argc, char* argv[]){
     FILE *output_file = fopen(output_filename, "wb");
     if(!output_file) {
         fprintf(stderr, "无法创建输出文件 %s\n", output_filename);
-        munmap(insn_page, PAGE_SIZE);
+        munmap(insn_region, PAGE_SIZE * 3);
         return 1;
     }
     
@@ -567,7 +600,7 @@ int main(int argc, char* argv[]){
     if(!timeout_file) {
         fprintf(stderr, "无法创建超时输出文件 %s\n", timeout_filename);
         fclose(output_file);
-        munmap(insn_page, PAGE_SIZE);
+        munmap(insn_region, PAGE_SIZE * 3);
         return 1;
     }
     
@@ -666,7 +699,7 @@ int main(int argc, char* argv[]){
     // 清理定时器
     timer_delete(watchdog_timer);
     
-    munmap(insn_page, PAGE_SIZE);
+    munmap(insn_region, PAGE_SIZE * 3);
     return 0;
         
 }
